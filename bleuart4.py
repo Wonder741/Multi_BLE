@@ -23,12 +23,16 @@ def sliced(data: bytes, n: int) -> Iterator[bytes]:
 # Main function for the program
 async def main():
     # Function to match devices that advertise the UART service UUID
-    def match_nus_uuid(device: BLEDevice, adv: AdvertisementData):
-        return UART_SERVICE_UUID.lower() in adv.service_uuids
+    """     def match_nus_uuid(device: BLEDevice, adv: AdvertisementData):
+        return UART_SERVICE_UUID.lower() in adv.service_uuids """
+    def match_nus_uuid(device: BLEDevice):
+        uuids = device.metadata.get('uuids', [])
+        return UART_SERVICE_UUID.lower() in uuids
 
     # Discover all BLE devices and filter those that match the UART service UUID
     devices = await BleakScanner.discover()
-    matching_devices = [device for device in devices if match_nus_uuid(device, device.metadata["advertisement_data"])]
+    matching_devices = [device for device in devices if match_nus_uuid(device)]
+    #matching_devices = [device for device in devices if match_nus_uuid(device, device.metadata["advertisement_data"])]
 
     # If no matching devices are found, exit the program
     if not matching_devices:
@@ -40,20 +44,22 @@ async def main():
     for index, device in enumerate(matching_devices):
         print(f"{index}: {device.name}")
 
-    device_index = int(input("Enter the index of the device to connect to: "))
-
-    # Check if the entered index is valid
-    if device_index < 0 or device_index >= len(matching_devices):
-        print("Invalid index. Exiting.")
+    device_indices_input = input("Enter the indices of the devices to connect to (separated by commas): ")
+    device_index = [int(index.strip()) for index in device_indices_input.split(',')]
+        
+    # Check if all device indices are in the valid range
+    if all(0 <= index < len(matching_devices) for index in device_index):
+        # Proceed with connecting to the devices
+        # Your code to connect to devices goes here
+        pass
+    else:
+        print(f"Invalid device indices. Please enter indices between 0 and {len(matching_devices) - 1}.")
         sys.exit(1)
-
-    # Select the device based on the user's input
-    selected_device = matching_devices[device_index]
-
-    # Function to handle device disconnection
+    
     def handle_disconnect(client: BleakClient):
         print(f"Device {client.address} was disconnected.")
-        del connected_clients[client.address]  # Remove the disconnected client from the list
+        if client.address in connected_clients:
+            del connected_clients[client.address]  # Remove the disconnected client from the list
         if not connected_clients:  # Check if there are no more connected clients
             print("All devices are disconnected, goodbye.")
             for task in asyncio.all_tasks():
@@ -65,34 +71,41 @@ async def main():
             file.write(f"{device_index}: {data}\n")
     
     # Function to handle data received from the device
-    def handle_rx(client: BleakClient, _: BleakGATTCharacteristic, data: bytearray):
-        device_index = connected_clients.get(client.address, "Unknown")
+    def handle_rx(index, _, data: bytearray):
+        device_index = connected_clients.get(index, "Unknown")
         print(f"Received from device {device_index}:", data)
         save_data_to_file(device_index, data)
-
-    # Connect to the selected device and set up notifications and data handling
-    async with BleakClient(selected_device, disconnected_callback=handle_disconnect) as client:
-        # Store the connected client with its index
-        connected_clients[client.address] = device_index  
-        for index, client in enumerate(connected_clients):
-            await client.start_notify(UART_TX_CHAR_UUID, lambda _, data: handle_rx(index, _, data))
-
-        print("Connected, start typing and press ENTER...")
+    
+    # Connect to the selected devices and set up notifications and data handling
+    connected_clients = {}  # Initialize as a dictionary
+    for index in device_index:
+        selected_device = matching_devices[index]
+        client = BleakClient(selected_device, disconnected_callback=handle_disconnect)
+        await client.connect()
+        await client.start_notify(UART_TX_CHAR_UUID, lambda _, data, index=index: handle_rx(index, _, data))
+        connected_clients[index] = client  # Use index as the key
+        print(f"Connected to device {index}: {selected_device.name}")
 
     # Loop to read data from stdin and send it to all connected devices
     while True:
-        data = await loop.run_in_executor(None, sys.stdin.buffer.readline)
+        #data = await loop.run_in_executor(None, sys.stdin.buffer.readline)
+        data = await loop.run_in_executor(None, lambda: sys.stdin.buffer.readline().rstrip(b'\r\n'))
 
         if not data:
             break
 
-        for client in connected_clients:
+        for index, client in connected_clients.items():
             nus = client.services.get_service(UART_SERVICE_UUID)
             rx_char = nus.get_characteristic(UART_RX_CHAR_UUID)
             for s in sliced(data, rx_char.max_write_without_response_size):
                 await client.write_gatt_char(rx_char, s, response=False)
 
         print("Sent:", data)
+
+    # Disconnect all clients when done
+    for index, client in connected_clients.items():
+        await client.disconnect()
+
 
 # Entry point of the program
 if __name__ == "__main__":
